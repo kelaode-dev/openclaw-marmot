@@ -10,7 +10,7 @@ import {
   resolveMarmotAccount,
   type ResolvedMarmotAccount,
 } from "./types.js";
-import { MarmotSidecar, resolveAccountStateDir } from "./sidecar.js";
+import { MarmotSidecar, resolveAccountStateDir, killStaleSidecar } from "./sidecar.js";
 import { resolveMarmotSidecarCommand } from "./sidecar-install.js";
 
 type MarmotSidecarHandle = {
@@ -499,11 +499,14 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
         resolveSidecarArgs(resolved.config.sidecarArgs) ??
         ["daemon", "--relay", relays[0] ?? "ws://127.0.0.1:18080", "--state-dir", baseStateDir];
 
+      // Kill any stale marmotd process from a previous run before spawning a new one.
+      killStaleSidecar(baseStateDir, ctx.log);
+
       ctx.log?.info(
         `[${resolved.accountId}] 🦞 MOLTATHON MARMOT v0.2.0 — starting sidecar cmd=${JSON.stringify(sidecarCmd)} args=${JSON.stringify(sidecarArgs)}`,
       );
 
-      const sidecar = new MarmotSidecar({ cmd: sidecarCmd, args: sidecarArgs });
+      const sidecar = new MarmotSidecar({ cmd: sidecarCmd, args: sidecarArgs, stateDir: baseStateDir });
       const ready = await sidecar.waitForReady(15_000);
       activeSidecars.set(resolved.accountId, {
         sidecar,

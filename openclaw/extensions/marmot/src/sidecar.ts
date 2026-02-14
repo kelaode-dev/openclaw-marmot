@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
+import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
@@ -61,6 +62,79 @@ export function resolveAccountStateDir(params: {
   return path.join(stateDir, "marmot", "accounts", sanitizePathSegment(params.accountId));
 }
 
+/**
+ * Resolve the PID file path for a given state directory.
+ */
+function pidFilePath(stateDir: string): string {
+  return path.join(stateDir, "marmotd.pid");
+}
+
+/**
+ * Check if a process with the given PID is alive.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Kill any stale marmotd process from a previous run.
+ * Reads the PID file, checks if the process is still alive, and kills it.
+ * Always removes the stale PID file afterward.
+ */
+export function killStaleSidecar(stateDir: string, log?: { info?: (msg: string) => void; warn?: (msg: string) => void }): void {
+  const pidPath = pidFilePath(stateDir);
+  let raw: string;
+  try {
+    raw = readFileSync(pidPath, "utf-8").trim();
+  } catch {
+    return; // No PID file — nothing to clean up.
+  }
+
+  const pid = parseInt(raw, 10);
+  if (!pid || isNaN(pid)) {
+    try { unlinkSync(pidPath); } catch { /* ignore */ }
+    return;
+  }
+
+  if (isProcessAlive(pid)) {
+    log?.warn?.(`[marmot] killing stale marmotd process pid=${pid}`);
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch (err) {
+      log?.warn?.(`[marmot] failed to kill stale pid=${pid}: ${err}`);
+    }
+    // Give it a moment, then force kill if still alive.
+    setTimeout(() => {
+      if (isProcessAlive(pid)) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+      }
+    }, 2000);
+  }
+
+  try { unlinkSync(pidPath); } catch { /* ignore */ }
+}
+
+/**
+ * Write the current sidecar PID to the state directory.
+ */
+function writePidFile(stateDir: string, pid: number): void {
+  try {
+    writeFileSync(pidFilePath(stateDir), String(pid) + "\n", { mode: 0o644 });
+  } catch { /* ignore — best effort */ }
+}
+
+/**
+ * Remove the PID file on clean shutdown.
+ */
+function removePidFile(stateDir: string): void {
+  try { unlinkSync(pidFilePath(stateDir)); } catch { /* ignore */ }
+}
+
 export class MarmotSidecar {
   #proc: ChildProcessWithoutNullStreams;
   #closed = false;
@@ -73,12 +147,20 @@ export class MarmotSidecar {
   #readyResolve: ((msg: SidecarOutMsg & { type: "ready" }) => void) | null = null;
   #readyReject: ((err: Error) => void) | null = null;
   #readyPromise: Promise<SidecarOutMsg & { type: "ready" }>;
+  #stateDir: string | null = null;
 
-  constructor(params: { cmd: string; args: string[]; env?: NodeJS.ProcessEnv }) {
+  constructor(params: { cmd: string; args: string[]; env?: NodeJS.ProcessEnv; stateDir?: string }) {
+    this.#stateDir = params.stateDir ?? null;
+
     this.#proc = spawn(params.cmd, params.args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...(params.env ?? {}) },
     });
+
+    // Write PID file so future startups can clean up stale processes.
+    if (this.#stateDir && this.#proc.pid) {
+      writePidFile(this.#stateDir, this.#proc.pid);
+    }
 
     // Keep stdout strictly for JSONL; log sidecar stderr through OpenClaw logger.
     const rl = readline.createInterface({ input: this.#proc.stdout });
@@ -193,6 +275,9 @@ export class MarmotSidecar {
       // ignore
     }
     this.#proc.kill("SIGTERM");
+    if (this.#stateDir) {
+      removePidFile(this.#stateDir);
+    }
   }
 
   async #handleLine(line: string): Promise<void> {
